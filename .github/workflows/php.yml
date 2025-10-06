@@ -1,0 +1,34 @@
+name: PHP Hello World
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+
+    - name: Hello World
+      run: echo "🎉 Hello World from GitHub Actions!"
+
+    - name: Check PHP version
+      run: php --version
+
+    - name: Run a PHP script
+      run: |
+        echo "<?php echo 'Hello from PHP!'; ?>" > hello.php
+        php hello.php
+
+    - name: List files
+      run: ls -la
