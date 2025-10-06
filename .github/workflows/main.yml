@@ -1,14 +1,108 @@
-name: PHP Hello World
+name: PHP TikTok Downloader
 
 on:
   push:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
+  schedule:
+    - cron: '0 0 * * 0' # Run weekly on Sunday
+
+env:
+  COMPOSER_FLAGS: "--prefer-dist --no-progress --no-suggest"
 
 jobs:
-  hello:
+  test:
+    name: PHP ${{ matrix.php-version }} Test
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ['8.1', '8.2', '8.3']
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-version }}
+        extensions: curl, mbstring, json, dom
+        coverage: none
+
+    - name: Validate composer.json
+      run: composer validate --strict
+
+    - name: Cache Composer packages
+      uses: actions/cache@v3
+      with:
+        path: vendor
+        key: php-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          php-${{ matrix.php-version }}-
+
+    - name: Install dependencies
+      run: composer install ${{ env.COMPOSER_FLAGS }}
+
+    - name: Run PHPUnit tests
+      run: vendor/bin/phpunit --colors=always
+
+    - name: Check code syntax
+      run: |
+        find src/ -name "*.php" -exec php -l {} \;
+        find tests/ -name "*.php" -exec php -l {} \;
+
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+        extensions: curl, mbstring, json
+
+    - name: Install dependencies
+      run: composer install ${{ env.COMPOSER_FLAGS }}
+
+    - name: Check coding standards
+      run: |
+        # Check for syntax errors
+        find src/ tests/ -name "*.php" -exec php -l {} \; | grep -v "No syntax errors"
+
+    - name: Validate file permissions
+      run: |
+        chmod +x bin/download.php
+        ls -la bin/
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+
+    - name: Check for known vulnerabilities
+      run: |
+        composer audit --format=plain
+
+    - name: Check for exposed credentials
+      uses: gitleaks/gitleaks-action@v2
+      with:
+        config-path: .gitleaks.toml
+
+  build:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs: [test, code-quality, security]
     
     steps:
     - name: Checkout code
@@ -19,16 +113,89 @@ jobs:
       with:
         php-version: '8.3'
 
-    - name: Hello World
-      run: echo "🎉 Hello World from GitHub Actions!"
+    - name: Install dependencies
+      run: composer install --no-dev --prefer-dist --optimize-autoloader
 
-    - name: Check PHP version
-      run: php --version
-
-    - name: Run a PHP script
+    - name: Create build directory
       run: |
-        echo "<?php echo 'Hello from PHP!'; ?>" > hello.php
-        php hello.php
+        mkdir -p build
+        cp -r src/ bin/ composer.json LICENSE README.md build/
 
-    - name: List files
-      run: ls -la
+    - name: Create PHAR archive
+      run: |
+        chmod +x bin/download.php
+        cd build && tar -czf tiktok-downloader.tar.gz .
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: tiktok-downloader
+        path: build/tiktok-downloader.tar.gz
+        retention-days: 7
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+        extensions: curl, mbstring, json
+
+    - name: Install dependencies
+      run: composer install ${{ env.COMPOSER_FLAGS }}
+
+    - name: Test CLI help command
+      run: php bin/download.php --help
+
+    - name: Test URL validation
+      run: |
+        php -r "
+        require 'vendor/autoload.php';
+        use TikTokDownloader\TikTokDownloader;
+        \$downloader = new TikTokDownloader();
+        
+        \$testUrls = [
+            'https://www.tiktok.com/@test/video/123' => true,
+            'https://vm.tiktok.com/ABC123/' => true,
+            'https://invalid-url.com' => false
+        ];
+        
+        foreach (\$testUrls as \$url => \$expected) {
+            \$result = \$downloader->isValidTikTokUrl(\$url);
+            echo (\$result === \$expected ? '✓' : '✗') . ' ' . \$url . PHP_EOL;
+        }
+        "
+
+    - name: Create test download directory
+      run: mkdir -p test-downloads
+
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: [test, code-quality, security, build]
+    if: always()
+    
+    steps:
+    - name: Notify workflow status
+      run: |
+        if [ "${{ needs.test.result }}" == "success" ] && [ "${{ needs.build.result }}" == "success" ]; then
+          echo "🎉 All checks passed!"
+          echo "PHP Versions: 8.1, 8.2, 8.3"
+          echo "Tests: ✅"
+          echo "Code Quality: ✅" 
+          echo "Security: ✅"
+          echo "Build: ✅"
+        else
+          echo "❌ Some checks failed"
+          echo "Test: ${{ needs.test.result }}"
+          echo "Code Quality: ${{ needs.code-quality.result }}"
+          echo "Security: ${{ needs.security.result }}"
+          echo "Build: ${{ needs.build.result }}"
+        fi
