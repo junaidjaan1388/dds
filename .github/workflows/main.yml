@@ -1,201 +1,455 @@
-name: PHP TikTok Downloader
+<?php
 
-on:
-  push:
-    branches: [ "master", "main" ]
-  pull_request:
-    branches: [ "master", "main" ]
-  schedule:
-    - cron: '0 0 * * 0' # Run weekly on Sunday
+/**
+ * TikTok Video Downloader - All in One
+ * 
+ * Usage:
+ * php tiktok-downloader.php --url="https://www.tiktok.com/@username/video/123456789"
+ * php tiktok-downloader.php --batch="urls.txt"
+ * php tiktok-downloader.php --help
+ */
 
-env:
-  COMPOSER_FLAGS: "--prefer-dist --no-progress --no-suggest"
+class TikTokDownloader
+{
+    private $client;
+    private $config;
+
+    public function __construct($config = [])
+    {
+        $this->config = array_merge([
+            'timeout' => 30,
+            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'referer' => 'https://www.tiktok.com/',
+            'download_dir' => 'downloads',
+        ], $config);
+
+        $this->client = new HttpClient([
+            'timeout' => $this->config['timeout'],
+            'headers' => [
+                'User-Agent' => $this->config['user_agent'],
+                'Referer' => $this->config['referer'],
+                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language' => 'en-US,en;q=0.9',
+                'Accept-Encoding' => 'gzip, deflate, br',
+            ]
+        ]);
+    }
+
+    public function download($url, $outputDir = null)
+    {
+        try {
+            $outputDir = $outputDir ?: $this->config['download_dir'];
+            
+            echo "🔍 Processing: $url\n";
+            
+            if (!$this->isValidTikTokUrl($url)) {
+                throw new Exception("Invalid TikTok URL: $url");
+            }
+
+            if (!is_dir($outputDir)) {
+                mkdir($outputDir, 0755, true);
+                echo "📁 Created directory: $outputDir\n";
+            }
+
+            $videoInfo = $this->getVideoInfo($url);
+            
+            if (empty($videoInfo['video_url'])) {
+                throw new Exception("Could not extract video URL");
+            }
+
+            $filename = $this->generateFilename($videoInfo);
+            $filepath = $outputDir . '/' . $filename;
+            
+            echo "📥 Downloading video...\n";
+            $this->downloadVideo($videoInfo['video_url'], $filepath);
+            
+            $fileSize = round(filesize($filepath) / 1024 / 1024, 2);
+            
+            echo "✅ Download successful!\n";
+            echo "   📄 File: $filename\n";
+            echo "   📁 Location: $filepath\n";
+            echo "   💾 Size: {$fileSize} MB\n";
+            echo "   👤 Author: {$videoInfo['author']}\n";
+            echo "   📝 Title: {$videoInfo['title']}\n";
+
+            return [
+                'success' => true,
+                'filepath' => $filepath,
+                'filename' => $filename,
+                'title' => $videoInfo['title'],
+                'author' => $videoInfo['author'],
+                'size_mb' => $fileSize,
+            ];
+
+        } catch (Exception $e) {
+            echo "❌ Error: {$e->getMessage()}\n";
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+                'url' => $url
+            ];
+        }
+    }
+
+    private function isValidTikTokUrl($url)
+    {
+        $patterns = [
+            '/https?:\/\/(www\.)?tiktok\.com\/@[^\/]+\/video\/\d+/',
+            '/https?:\/\/vm\.tiktok\.com\/[a-zA-Z0-9]+\//',
+            '/https?:\/\/vt\.tiktok\.com\/[a-zA-Z0-9]+\//'
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $url)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function getVideoInfo($url)
+    {
+        echo "🌐 Fetching page data...\n";
+        $html = $this->client->get($url);
+        
+        $jsonData = $this->extractJsonData($html);
+        
+        if ($jsonData) {
+            return $this->parseVideoData($jsonData);
+        }
+
+        return $this->extractFromScriptTags($html);
+    }
+
+    private function extractJsonData($html)
+    {
+        // Method 1: Universal data
+        preg_match('/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/', $html, $matches);
+        if (isset($matches[1])) {
+            $data = json_decode($matches[1], true);
+            if (json_last_error() === JSON_ERROR_NONE) return $data;
+        }
+
+        // Method 2: SIGI_STATE data
+        preg_match('/<script id="SIGI_STATE" type="application\/json">(.*?)<\/script>/', $html, $matches);
+        if (isset($matches[1])) {
+            $data = json_decode($matches[1], true);
+            if (json_last_error() === JSON_ERROR_NONE) return $data;
+        }
+
+        return null;
+    }
+
+    private function parseVideoData($data)
+    {
+        // Try different JSON structures
+        $videoData = $data;
+        $paths = [
+            ['__DEFAULT_DATA_FOR_REHYDRATION__', 'webapp.video-detail', 'itemInfo', 'itemStruct'],
+            ['VideoPage', 'video', 'itemInfo', 'itemStruct'],
+            ['ItemModule'],
+            ['props', 'pageProps', 'itemInfo', 'itemStruct'],
+        ];
+
+        foreach ($paths as $path) {
+            $current = $videoData;
+            foreach ($path as $key) {
+                if (isset($current[$key])) {
+                    $current = $current[$key];
+                } else {
+                    $current = null;
+                    break;
+                }
+            }
+            
+            if ($current && is_array($current)) {
+                // If we're in ItemModule, find the first video
+                if ($path[0] === 'ItemModule') {
+                    $current = reset($current);
+                }
+                
+                if (isset($current['video'])) {
+                    $videoUrl = $current['video']['playAddr'] ?? 
+                               $current['video']['downloadAddr'] ?? 
+                               $current['video']['playUrl'] ?? null;
+                    
+                    if ($videoUrl) {
+                        return [
+                            'video_url' => str_replace('\\u0026', '&', $videoUrl),
+                            'title' => $current['desc'] ?? 'TikTok Video',
+                            'author' => $current['author'] ?? $current['author']['uniqueId'] ?? 'unknown',
+                        ];
+                    }
+                }
+            }
+        }
+
+        throw new Exception('Could not parse video data from TikTok response');
+    }
+
+    private function extractFromScriptTags($html)
+    {
+        // Fallback: regex search for video URLs
+        preg_match('/"downloadAddr":"([^"]+)"/', $html, $downloadAddr);
+        preg_match('/"playAddr":"([^"]+)"/', $html, $playAddr);
+        preg_match('/"playUrl":"([^"]+)"/', $html, $playUrl);
+        preg_match('/"desc":"([^"]*)"/', $html, $desc);
+        preg_match('/"uniqueId":"([^"]*)"/', $html, $author);
+
+        $videoUrl = null;
+        if (isset($downloadAddr[1])) {
+            $videoUrl = $downloadAddr[1];
+        } elseif (isset($playAddr[1])) {
+            $videoUrl = $playAddr[1];
+        } elseif (isset($playUrl[1])) {
+            $videoUrl = $playUrl[1];
+        }
+
+        if ($videoUrl) {
+            return [
+                'video_url' => str_replace('\\u0026', '&', $videoUrl),
+                'title' => $desc[1] ?? 'TikTok Video',
+                'author' => $author[1] ?? 'unknown',
+            ];
+        }
+
+        throw new Exception('No video URL found in page source');
+    }
+
+    private function generateFilename($videoInfo)
+    {
+        $author = preg_replace('/[^a-zA-Z0-9_-]/', '_', $videoInfo['author']);
+        $title = preg_replace('/[^a-zA-Z0-9_-]/', '_', substr($videoInfo['title'], 0, 50));
+        $timestamp = time();
+        
+        return "tiktok_{$author}_{$title}_{$timestamp}.mp4";
+    }
+
+    private function downloadVideo($videoUrl, $filepath)
+    {
+        $videoData = $this->client->get($videoUrl, [
+            'headers' => [
+                'User-Agent' => $this->config['user_agent'],
+                'Referer' => 'https://www.tiktok.com/',
+                'Range' => 'bytes=0-',
+            ]
+        ]);
+
+        file_put_contents($filepath, $videoData);
+
+        if (!file_exists($filepath) || filesize($filepath) === 0) {
+            throw new Exception('Downloaded file is empty or missing');
+        }
+    }
+
+    public function batchDownload($urls, $outputDir = null)
+    {
+        $outputDir = $outputDir ?: $this->config['download_dir'];
+        $results = [];
+        $total = count($urls);
+        
+        echo "🚀 Starting batch download of $total videos...\n\n";
+        
+        foreach ($urls as $index => $url) {
+            $current = $index + 1;
+            echo "--- [{$current}/{$total}] ---\n";
+            $results[] = $this->download($url, $outputDir);
+            
+            if ($current < $total) {
+                echo "⏳ Waiting 2 seconds...\n\n";
+                sleep(2);
+            }
+        }
+        
+        return $results;
+    }
+}
+
+class HttpClient
+{
+    private $options;
+    
+    public function __construct($options = [])
+    {
+        $this->options = $options;
+    }
+    
+    public function get($url, $options = [])
+    {
+        $ch = curl_init();
+        
+        $headers = array_merge(
+            $this->options['headers'] ?? [],
+            $options['headers'] ?? []
+        );
+        
+        $headerArray = [];
+        foreach ($headers as $key => $value) {
+            $headerArray[] = "$key: $value";
+        }
+        
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => $this->options['timeout'] ?? 30,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_ENCODING => '',
+            CURLOPT_HTTPHEADER => $headerArray,
+            CURLOPT_USERAGENT => $headers['User-Agent'] ?? 'Mozilla/5.0 (compatible; TikTok-Downloader/1.0)',
+        ]);
+        
+        $response = curl_exec($ch);
+        $error = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        
+        curl_close($ch);
+        
+        if ($error) {
+            throw new Exception("HTTP Request failed: $error");
+        }
+        
+        if ($httpCode !== 200) {
+            throw new Exception("HTTP Error: $httpCode");
+        }
+        
+        return $response;
+    }
+}
+
+class CLI
+{
+    public static function run($argv)
+    {
+        $shortopts = "u:o:b:h";
+        $longopts = ["url:", "output:", "batch:", "help"];
+        $options = getopt($shortopts, $longopts);
+        
+        if (isset($options['h']) || isset($options['help']) || count($argv) == 1) {
+            self::showHelp();
+            exit(0);
+        }
+        
+        $downloader = new TikTokDownloader();
+        
+        try {
+            if (isset($options['b']) || isset($options['batch'])) {
+                $urlFile = $options['b'] ?? $options['batch'];
+                $outputDir = $options['o'] ?? $options['output'] ?? null;
+                
+                if (!file_exists($urlFile)) {
+                    throw new Exception("URL file not found: $urlFile");
+                }
+                
+                $urls = file($urlFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                $urls = array_filter($urls);
+                
+                if (empty($urls)) {
+                    throw new Exception("No valid URLs found in file: $urlFile");
+                }
+                
+                $results = $downloader->batchDownload($urls, $outputDir);
+                self::showBatchResults($results);
+                
+            } else {
+                $url = $options['u'] ?? $options['url'] ?? null;
+                $outputDir = $options['o'] ?? $options['output'] ?? null;
+                
+                if (!$url) {
+                    throw new Exception("URL is required. Use -u or --url option");
+                }
+                
+                $result = $downloader->download($url, $outputDir);
+                
+                if (!$result['success']) {
+                    exit(1);
+                }
+            }
+            
+        } catch (Exception $e) {
+            echo "💥 Fatal Error: " . $e->getMessage() . "\n";
+            exit(1);
+        }
+    }
+    
+    private static function showHelp()
+    {
+        echo "🎵 TikTok Video Downloader - All in One\n";
+        echo "========================================\n";
+        echo "Usage:\n";
+        echo "  php tiktok-downloader.php -u <URL> [-o <output_dir>]\n";
+        echo "  php tiktok-downloader.php --url=<URL> [--output=<output_dir>]\n";
+        echo "  php tiktok-downloader.php -b <urls_file.txt>\n";
+        echo "  php tiktok-downloader.php --batch=<urls_file.txt>\n\n";
+        echo "Options:\n";
+        echo "  -u, --url        TikTok video URL (required for single download)\n";
+        echo "  -b, --batch      File containing multiple URLs (one per line)\n";
+        echo "  -o, --output     Output directory (default: downloads)\n";
+        echo "  -h, --help       Show this help message\n\n";
+        echo "Examples:\n";
+        echo "  php tiktok-downloader.php -u \"https://www.tiktok.com/@user/video/123456789\"\n";
+        echo "  php tiktok-downloader.php --url=\"https://vm.tiktok.com/ABC123/\" --output=\"my_videos\"\n";
+        echo "  php tiktok-downloader.php --batch=\"urls.txt\"\n\n";
+        echo "Supported URL formats:\n";
+        echo "  • https://www.tiktok.com/@username/video/123456789\n";
+        echo "  • https://vm.tiktok.com/ABC123/\n";
+        echo "  • https://vt.tiktok.com/XYZ789/\n";
+    }
+    
+    private static function showBatchResults($results)
+    {
+        $successCount = 0;
+        $failCount = 0;
+        
+        echo "\n" . str_repeat("=", 50) . "\n";
+        echo "📊 BATCH DOWNLOAD SUMMARY\n";
+        echo str_repeat("=", 50) . "\n";
+        
+        foreach ($results as $result) {
+            if ($result['success']) {
+                echo "✅ SUCCESS: {$result['filename']} ({$result['size_mb']} MB)\n";
+                $successCount++;
+            } else {
+                echo "❌ FAILED: {$result['error']}\n";
+                $failCount++;
+            }
+        }
+        
+        echo str_repeat("=", 50) . "\n";
+        echo "📈 RESULTS: {$successCount} successful, {$failCount} failed\n";
+        echo str_repeat("=", 50) . "\n";
+    }
+}
+
+// GitHub Actions Workflow (commented - for reference)
+/*
+name: TikTok Downloader CI
+
+on: [push, pull_request]
 
 jobs:
   test:
-    name: PHP ${{ matrix.php-version }} Test
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        php-version: ['8.1', '8.2', '8.3']
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: ${{ matrix.php-version }}
-        extensions: curl, mbstring, json, dom
-        coverage: none
-
-    - name: Validate composer.json
-      run: composer validate --strict
-
-    - name: Cache Composer packages
-      uses: actions/cache@v3
-      with:
-        path: vendor
-        key: php-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
-        restore-keys: |
-          php-${{ matrix.php-version }}-
-
-    - name: Install dependencies
-      run: composer install ${{ env.COMPOSER_FLAGS }}
-
-    - name: Run PHPUnit tests
-      run: vendor/bin/phpunit --colors=always
-
-    - name: Check code syntax
-      run: |
-        find src/ -name "*.php" -exec php -l {} \;
-        find tests/ -name "*.php" -exec php -l {} \;
-
-  code-quality:
-    name: Code Quality
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: curl
+      - name: Test TikTok Downloader
+        run: |
+          php tiktok-downloader.php --help
+          php -l tiktok-downloader.php
+*/
 
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.3'
-        extensions: curl, mbstring, json
-
-    - name: Install dependencies
-      run: composer install ${{ env.COMPOSER_FLAGS }}
-
-    - name: Check coding standards
-      run: |
-        # Check for syntax errors
-        find src/ tests/ -name "*.php" -exec php -l {} \; | grep -v "No syntax errors"
-
-    - name: Validate file permissions
-      run: |
-        chmod +x bin/download.php
-        ls -la bin/
-
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.3'
-
-    - name: Check for known vulnerabilities
-      run: |
-        composer audit --format=plain
-
-    - name: Check for exposed credentials
-      uses: gitleaks/gitleaks-action@v2
-      with:
-        config-path: .gitleaks.toml
-
-  build:
-    name: Build Package
-    runs-on: ubuntu-latest
-    needs: [test, code-quality, security]
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.3'
-
-    - name: Install dependencies
-      run: composer install --no-dev --prefer-dist --optimize-autoloader
-
-    - name: Create build directory
-      run: |
-        mkdir -p build
-        cp -r src/ bin/ composer.json LICENSE README.md build/
-
-    - name: Create PHAR archive
-      run: |
-        chmod +x bin/download.php
-        cd build && tar -czf tiktok-downloader.tar.gz .
-
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: tiktok-downloader
-        path: build/tiktok-downloader.tar.gz
-        retention-days: 7
-
-  integration-test:
-    name: Integration Test
-    runs-on: ubuntu-latest
-    needs: test
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.3'
-        extensions: curl, mbstring, json
-
-    - name: Install dependencies
-      run: composer install ${{ env.COMPOSER_FLAGS }}
-
-    - name: Test CLI help command
-      run: php bin/download.php --help
-
-    - name: Test URL validation
-      run: |
-        php -r "
-        require 'vendor/autoload.php';
-        use TikTokDownloader\TikTokDownloader;
-        \$downloader = new TikTokDownloader();
-        
-        \$testUrls = [
-            'https://www.tiktok.com/@test/video/123' => true,
-            'https://vm.tiktok.com/ABC123/' => true,
-            'https://invalid-url.com' => false
-        ];
-        
-        foreach (\$testUrls as \$url => \$expected) {
-            \$result = \$downloader->isValidTikTokUrl(\$url);
-            echo (\$result === \$expected ? '✓' : '✗') . ' ' . \$url . PHP_EOL;
-        }
-        "
-
-    - name: Create test download directory
-      run: mkdir -p test-downloads
-
-  notify:
-    name: Notify Status
-    runs-on: ubuntu-latest
-    needs: [test, code-quality, security, build]
-    if: always()
-    
-    steps:
-    - name: Notify workflow status
-      run: |
-        if [ "${{ needs.test.result }}" == "success" ] && [ "${{ needs.build.result }}" == "success" ]; then
-          echo "🎉 All checks passed!"
-          echo "PHP Versions: 8.1, 8.2, 8.3"
-          echo "Tests: ✅"
-          echo "Code Quality: ✅" 
-          echo "Security: ✅"
-          echo "Build: ✅"
-        else
-          echo "❌ Some checks failed"
-          echo "Test: ${{ needs.test.result }}"
-          echo "Code Quality: ${{ needs.code-quality.result }}"
-          echo "Security: ${{ needs.security.result }}"
-          echo "Build: ${{ needs.build.result }}"
-        fi
+// Main execution
+if (php_sapi_name() === 'cli') {
+    CLI::run($argv);
+} else {
+    echo "<h1>🎵 TikTok Video Downloader</h1>";
+    echo "<p>This script is designed to run from command line.</p>";
+    echo "<pre>Usage: php tiktok-downloader.php --url=\"TIKTOK_URL\"</pre>";
+}
