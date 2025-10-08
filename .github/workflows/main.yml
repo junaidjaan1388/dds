@@ -1,455 +1,273 @@
-<?php
+name: Video Downloader and Processor
 
-/**
- * TikTok Video Downloader - All in One
- * 
- * Usage:
- * php tiktok-downloader.php --url="https://www.tiktok.com/@username/video/123456789"
- * php tiktok-downloader.php --batch="urls.txt"
- * php tiktok-downloader.php --help
- */
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: 'URL to download'
+        required: true
+        type: string
+      output_filename:
+        description: 'Output filename'
+        required: false
+        type: string
+        default: 'downloaded_file'
+      download_type:
+        description: 'Download type'
+        required: false
+        type: choice
+        options:
+        - single
+        - batch
+        - video_info
+        default: 'single'
 
-class TikTokDownloader
-{
-    private $client;
-    private $config;
-
-    public function __construct($config = [])
-    {
-        $this->config = array_merge([
-            'timeout' => 30,
-            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'referer' => 'https://www.tiktok.com/',
-            'download_dir' => 'downloads',
-        ], $config);
-
-        $this->client = new HttpClient([
-            'timeout' => $this->config['timeout'],
-            'headers' => [
-                'User-Agent' => $this->config['user_agent'],
-                'Referer' => $this->config['referer'],
-                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language' => 'en-US,en;q=0.9',
-                'Accept-Encoding' => 'gzip, deflate, br',
-            ]
-        ]);
-    }
-
-    public function download($url, $outputDir = null)
-    {
-        try {
-            $outputDir = $outputDir ?: $this->config['download_dir'];
-            
-            echo "🔍 Processing: $url\n";
-            
-            if (!$this->isValidTikTokUrl($url)) {
-                throw new Exception("Invalid TikTok URL: $url");
-            }
-
-            if (!is_dir($outputDir)) {
-                mkdir($outputDir, 0755, true);
-                echo "📁 Created directory: $outputDir\n";
-            }
-
-            $videoInfo = $this->getVideoInfo($url);
-            
-            if (empty($videoInfo['video_url'])) {
-                throw new Exception("Could not extract video URL");
-            }
-
-            $filename = $this->generateFilename($videoInfo);
-            $filepath = $outputDir . '/' . $filename;
-            
-            echo "📥 Downloading video...\n";
-            $this->downloadVideo($videoInfo['video_url'], $filepath);
-            
-            $fileSize = round(filesize($filepath) / 1024 / 1024, 2);
-            
-            echo "✅ Download successful!\n";
-            echo "   📄 File: $filename\n";
-            echo "   📁 Location: $filepath\n";
-            echo "   💾 Size: {$fileSize} MB\n";
-            echo "   👤 Author: {$videoInfo['author']}\n";
-            echo "   📝 Title: {$videoInfo['title']}\n";
-
-            return [
-                'success' => true,
-                'filepath' => $filepath,
-                'filename' => $filename,
-                'title' => $videoInfo['title'],
-                'author' => $videoInfo['author'],
-                'size_mb' => $fileSize,
-            ];
-
-        } catch (Exception $e) {
-            echo "❌ Error: {$e->getMessage()}\n";
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-                'url' => $url
-            ];
-        }
-    }
-
-    private function isValidTikTokUrl($url)
-    {
-        $patterns = [
-            '/https?:\/\/(www\.)?tiktok\.com\/@[^\/]+\/video\/\d+/',
-            '/https?:\/\/vm\.tiktok\.com\/[a-zA-Z0-9]+\//',
-            '/https?:\/\/vt\.tiktok\.com\/[a-zA-Z0-9]+\//'
-        ];
-
-        foreach ($patterns as $pattern) {
-            if (preg_match($pattern, $url)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private function getVideoInfo($url)
-    {
-        echo "🌐 Fetching page data...\n";
-        $html = $this->client->get($url);
-        
-        $jsonData = $this->extractJsonData($html);
-        
-        if ($jsonData) {
-            return $this->parseVideoData($jsonData);
-        }
-
-        return $this->extractFromScriptTags($html);
-    }
-
-    private function extractJsonData($html)
-    {
-        // Method 1: Universal data
-        preg_match('/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/', $html, $matches);
-        if (isset($matches[1])) {
-            $data = json_decode($matches[1], true);
-            if (json_last_error() === JSON_ERROR_NONE) return $data;
-        }
-
-        // Method 2: SIGI_STATE data
-        preg_match('/<script id="SIGI_STATE" type="application\/json">(.*?)<\/script>/', $html, $matches);
-        if (isset($matches[1])) {
-            $data = json_decode($matches[1], true);
-            if (json_last_error() === JSON_ERROR_NONE) return $data;
-        }
-
-        return null;
-    }
-
-    private function parseVideoData($data)
-    {
-        // Try different JSON structures
-        $videoData = $data;
-        $paths = [
-            ['__DEFAULT_DATA_FOR_REHYDRATION__', 'webapp.video-detail', 'itemInfo', 'itemStruct'],
-            ['VideoPage', 'video', 'itemInfo', 'itemStruct'],
-            ['ItemModule'],
-            ['props', 'pageProps', 'itemInfo', 'itemStruct'],
-        ];
-
-        foreach ($paths as $path) {
-            $current = $videoData;
-            foreach ($path as $key) {
-                if (isset($current[$key])) {
-                    $current = $current[$key];
-                } else {
-                    $current = null;
-                    break;
-                }
-            }
-            
-            if ($current && is_array($current)) {
-                // If we're in ItemModule, find the first video
-                if ($path[0] === 'ItemModule') {
-                    $current = reset($current);
-                }
-                
-                if (isset($current['video'])) {
-                    $videoUrl = $current['video']['playAddr'] ?? 
-                               $current['video']['downloadAddr'] ?? 
-                               $current['video']['playUrl'] ?? null;
-                    
-                    if ($videoUrl) {
-                        return [
-                            'video_url' => str_replace('\\u0026', '&', $videoUrl),
-                            'title' => $current['desc'] ?? 'TikTok Video',
-                            'author' => $current['author'] ?? $current['author']['uniqueId'] ?? 'unknown',
-                        ];
-                    }
-                }
-            }
-        }
-
-        throw new Exception('Could not parse video data from TikTok response');
-    }
-
-    private function extractFromScriptTags($html)
-    {
-        // Fallback: regex search for video URLs
-        preg_match('/"downloadAddr":"([^"]+)"/', $html, $downloadAddr);
-        preg_match('/"playAddr":"([^"]+)"/', $html, $playAddr);
-        preg_match('/"playUrl":"([^"]+)"/', $html, $playUrl);
-        preg_match('/"desc":"([^"]*)"/', $html, $desc);
-        preg_match('/"uniqueId":"([^"]*)"/', $html, $author);
-
-        $videoUrl = null;
-        if (isset($downloadAddr[1])) {
-            $videoUrl = $downloadAddr[1];
-        } elseif (isset($playAddr[1])) {
-            $videoUrl = $playAddr[1];
-        } elseif (isset($playUrl[1])) {
-            $videoUrl = $playUrl[1];
-        }
-
-        if ($videoUrl) {
-            return [
-                'video_url' => str_replace('\\u0026', '&', $videoUrl),
-                'title' => $desc[1] ?? 'TikTok Video',
-                'author' => $author[1] ?? 'unknown',
-            ];
-        }
-
-        throw new Exception('No video URL found in page source');
-    }
-
-    private function generateFilename($videoInfo)
-    {
-        $author = preg_replace('/[^a-zA-Z0-9_-]/', '_', $videoInfo['author']);
-        $title = preg_replace('/[^a-zA-Z0-9_-]/', '_', substr($videoInfo['title'], 0, 50));
-        $timestamp = time();
-        
-        return "tiktok_{$author}_{$title}_{$timestamp}.mp4";
-    }
-
-    private function downloadVideo($videoUrl, $filepath)
-    {
-        $videoData = $this->client->get($videoUrl, [
-            'headers' => [
-                'User-Agent' => $this->config['user_agent'],
-                'Referer' => 'https://www.tiktok.com/',
-                'Range' => 'bytes=0-',
-            ]
-        ]);
-
-        file_put_contents($filepath, $videoData);
-
-        if (!file_exists($filepath) || filesize($filepath) === 0) {
-            throw new Exception('Downloaded file is empty or missing');
-        }
-    }
-
-    public function batchDownload($urls, $outputDir = null)
-    {
-        $outputDir = $outputDir ?: $this->config['download_dir'];
-        $results = [];
-        $total = count($urls);
-        
-        echo "🚀 Starting batch download of $total videos...\n\n";
-        
-        foreach ($urls as $index => $url) {
-            $current = $index + 1;
-            echo "--- [{$current}/{$total}] ---\n";
-            $results[] = $this->download($url, $outputDir);
-            
-            if ($current < $total) {
-                echo "⏳ Waiting 2 seconds...\n\n";
-                sleep(2);
-            }
-        }
-        
-        return $results;
-    }
-}
-
-class HttpClient
-{
-    private $options;
-    
-    public function __construct($options = [])
-    {
-        $this->options = $options;
-    }
-    
-    public function get($url, $options = [])
-    {
-        $ch = curl_init();
-        
-        $headers = array_merge(
-            $this->options['headers'] ?? [],
-            $options['headers'] ?? []
-        );
-        
-        $headerArray = [];
-        foreach ($headers as $key => $value) {
-            $headerArray[] = "$key: $value";
-        }
-        
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT => $this->options['timeout'] ?? 30,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_ENCODING => '',
-            CURLOPT_HTTPHEADER => $headerArray,
-            CURLOPT_USERAGENT => $headers['User-Agent'] ?? 'Mozilla/5.0 (compatible; TikTok-Downloader/1.0)',
-        ]);
-        
-        $response = curl_exec($ch);
-        $error = curl_error($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        
-        curl_close($ch);
-        
-        if ($error) {
-            throw new Exception("HTTP Request failed: $error");
-        }
-        
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP Error: $httpCode");
-        }
-        
-        return $response;
-    }
-}
-
-class CLI
-{
-    public static function run($argv)
-    {
-        $shortopts = "u:o:b:h";
-        $longopts = ["url:", "output:", "batch:", "help"];
-        $options = getopt($shortopts, $longopts);
-        
-        if (isset($options['h']) || isset($options['help']) || count($argv) == 1) {
-            self::showHelp();
-            exit(0);
-        }
-        
-        $downloader = new TikTokDownloader();
-        
-        try {
-            if (isset($options['b']) || isset($options['batch'])) {
-                $urlFile = $options['b'] ?? $options['batch'];
-                $outputDir = $options['o'] ?? $options['output'] ?? null;
-                
-                if (!file_exists($urlFile)) {
-                    throw new Exception("URL file not found: $urlFile");
-                }
-                
-                $urls = file($urlFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                $urls = array_filter($urls);
-                
-                if (empty($urls)) {
-                    throw new Exception("No valid URLs found in file: $urlFile");
-                }
-                
-                $results = $downloader->batchDownload($urls, $outputDir);
-                self::showBatchResults($results);
-                
-            } else {
-                $url = $options['u'] ?? $options['url'] ?? null;
-                $outputDir = $options['o'] ?? $options['output'] ?? null;
-                
-                if (!$url) {
-                    throw new Exception("URL is required. Use -u or --url option");
-                }
-                
-                $result = $downloader->download($url, $outputDir);
-                
-                if (!$result['success']) {
-                    exit(1);
-                }
-            }
-            
-        } catch (Exception $e) {
-            echo "💥 Fatal Error: " . $e->getMessage() . "\n";
-            exit(1);
-        }
-    }
-    
-    private static function showHelp()
-    {
-        echo "🎵 TikTok Video Downloader - All in One\n";
-        echo "========================================\n";
-        echo "Usage:\n";
-        echo "  php tiktok-downloader.php -u <URL> [-o <output_dir>]\n";
-        echo "  php tiktok-downloader.php --url=<URL> [--output=<output_dir>]\n";
-        echo "  php tiktok-downloader.php -b <urls_file.txt>\n";
-        echo "  php tiktok-downloader.php --batch=<urls_file.txt>\n\n";
-        echo "Options:\n";
-        echo "  -u, --url        TikTok video URL (required for single download)\n";
-        echo "  -b, --batch      File containing multiple URLs (one per line)\n";
-        echo "  -o, --output     Output directory (default: downloads)\n";
-        echo "  -h, --help       Show this help message\n\n";
-        echo "Examples:\n";
-        echo "  php tiktok-downloader.php -u \"https://www.tiktok.com/@user/video/123456789\"\n";
-        echo "  php tiktok-downloader.php --url=\"https://vm.tiktok.com/ABC123/\" --output=\"my_videos\"\n";
-        echo "  php tiktok-downloader.php --batch=\"urls.txt\"\n\n";
-        echo "Supported URL formats:\n";
-        echo "  • https://www.tiktok.com/@username/video/123456789\n";
-        echo "  • https://vm.tiktok.com/ABC123/\n";
-        echo "  • https://vt.tiktok.com/XYZ789/\n";
-    }
-    
-    private static function showBatchResults($results)
-    {
-        $successCount = 0;
-        $failCount = 0;
-        
-        echo "\n" . str_repeat("=", 50) . "\n";
-        echo "📊 BATCH DOWNLOAD SUMMARY\n";
-        echo str_repeat("=", 50) . "\n";
-        
-        foreach ($results as $result) {
-            if ($result['success']) {
-                echo "✅ SUCCESS: {$result['filename']} ({$result['size_mb']} MB)\n";
-                $successCount++;
-            } else {
-                echo "❌ FAILED: {$result['error']}\n";
-                $failCount++;
-            }
-        }
-        
-        echo str_repeat("=", 50) . "\n";
-        echo "📈 RESULTS: {$successCount} successful, {$failCount} failed\n";
-        echo str_repeat("=", 50) . "\n";
-    }
-}
-
-// GitHub Actions Workflow (commented - for reference)
-/*
-name: TikTok Downloader CI
-
-on: [push, pull_request]
+env:
+  PYTHON_VERSION: '3.9'
 
 jobs:
-  test:
+  download-and-process:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-          extensions: curl
-      - name: Test TikTok Downloader
-        run: |
-          php tiktok-downloader.php --help
-          php -l tiktok-downloader.php
-*/
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-// Main execution
-if (php_sapi_name() === 'cli') {
-    CLI::run($argv);
-} else {
-    echo "<h1>🎵 TikTok Video Downloader</h1>";
-    echo "<p>This script is designed to run from command line.</p>";
-    echo "<pre>Usage: php tiktok-downloader.php --url=\"TIKTOK_URL\"</pre>";
-}
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          ffmpeg \
+          aria2 \
+          python3-pip
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install \
+          aiohttp \
+          aiofiles \
+          requests
+
+    - name: Create download utilities script
+      run: |
+        cat > download_utils.py << 'EOF'
+        # Video Downloader Utilities for GitHub Actions
+        import os
+        import sys
+        import json
+        import aiohttp
+        import aiofiles
+        import asyncio
+        import subprocess
+        
+        def duration(filename):
+            """Get video duration using ffprobe"""
+            result = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration", "-of",
+                "default=noprint_wrappers=1:nokey=1", filename
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            return float(result.stdout)
+        
+        async def download_file(url, name):
+            """Async download wrapper"""
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        f = await aiofiles.open(name, mode='wb')
+                        await f.write(await resp.read())
+                        await f.close()
+            return name
+        
+        def get_video_info(video_path):
+            """Get comprehensive video information"""
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams', video_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return json.loads(result.stdout)
+            return None
+        
+        def generate_thumbnail(video_path, time_position="00:00:10"):
+            """Generate thumbnail from video"""
+            thumbnail_path = f"{video_path}.jpg"
+            cmd = f'ffmpeg -i "{video_path}" -ss {time_position} -vframes 1 -q:v 2 "{thumbnail_path}"'
+            subprocess.run(cmd, shell=True, capture_output=True)
+            return thumbnail_path if os.path.exists(thumbnail_path) else None
+        
+        async def download_with_ytdlp(url, output_name):
+            """Download using yt-dlp with aria2c"""
+            cmd = f'yt-dlp -f "best[height<=720]" -o "{output_name}" --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32" {url}'
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            return process.returncode == 0
+        EOF
+
+    - name: Single file download
+      if: inputs.download_type == 'single'
+      run: |
+        python << 'EOF'
+        import asyncio
+        import os
+        from download_utils import download_file, get_video_info, generate_thumbnail
+        
+        async def main():
+            url = "${{ github.event.inputs.download_url }}"
+            output_name = "${{ github.event.inputs.output_filename }}"
+            
+            print(f"🚀 Starting download from: {url}")
+            print(f"📁 Output file: {output_name}")
+            
+            # Download file
+            result = await download_file(url, output_name)
+            if result:
+                print(f"✅ Download completed: {result}")
+                
+                # Get file size
+                file_size = os.path.getsize(output_name)
+                print(f"📊 File size: {file_size} bytes")
+                
+                # If it's a video file, get info and generate thumbnail
+                if output_name.lower().endswith(('.mp4', '.mkv', '.webm', '.avi')):
+                    print("🎥 Video file detected, gathering info...")
+                    video_info = get_video_info(output_name)
+                    if video_info:
+                        print(f"📹 Video info: {json.dumps(video_info, indent=2)}")
+                    
+                    thumbnail = generate_thumbnail(output_name)
+                    if thumbnail:
+                        print(f"🖼️ Thumbnail generated: {thumbnail}")
+            else:
+                print("❌ Download failed")
+                sys.exit(1)
+        
+        asyncio.run(main())
+        EOF
+
+    - name: Batch download processor
+      if: inputs.download_type == 'batch'
+      run: |
+        python << 'EOF'
+        import asyncio
+        import aiohttp
+        import aiofiles
+        import json
+        
+        async def download_batch():
+            # Read URLs from file or use provided URL as list source
+            url = "${{ github.event.inputs.download_url }}"
+            output_name = "${{ github.event.inputs.output_filename }}"
+            
+            print("🔄 Starting batch download process...")
+            
+            # This could be extended to read from a URLs file
+            # For now, using a simple example
+            urls = [url]  # In real scenario, this would be multiple URLs
+            
+            async with aiohttp.ClientSession() as session:
+                tasks = []
+                for i, download_url in enumerate(urls):
+                    filename = f"{output_name}_{i+1}.mp4"
+                    task = download_single(session, download_url, filename)
+                    tasks.append(task)
+                
+                results = await asyncio.gather(*tasks)
+                print(f"📊 Batch download completed. Results: {results}")
+        
+        async def download_single(session, url, filename):
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        async with aiofiles.open(filename, 'wb') as file:
+                            await file.write(await response.read())
+                        print(f"✅ Downloaded: {filename}")
+                        return filename
+                    else:
+                        print(f"❌ Failed to download {url}: HTTP {response.status}")
+                        return None
+            except Exception as e:
+                print(f"❌ Error downloading {url}: {str(e)}")
+                return None
+        
+        asyncio.run(download_batch())
+        EOF
+
+    - name: Video information extractor
+      if: inputs.download_type == 'video_info'
+      run: |
+        python << 'EOF'
+        import os
+        import json
+        from download_utils import get_video_info, duration, generate_thumbnail
+        
+        def analyze_video():
+            url = "${{ github.event.inputs.download_url }}"
+            output_name = "${{ github.event.inputs.output_filename }}"
+            
+            print("🔍 Analyzing video information...")
+            
+            # First download the video
+            import requests
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(output_name, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                print(f"✅ Video downloaded: {output_name}")
+                
+                # Get video duration
+                vid_duration = duration(output_name)
+                print(f"⏱️ Duration: {vid_duration:.2f} seconds")
+                
+                # Get comprehensive video info
+                video_info = get_video_info(output_name)
+                if video_info:
+                    print("📊 Video Analysis Results:")
+                    print(json.dumps(video_info, indent=2))
+                
+                # Generate thumbnail
+                thumbnail = generate_thumbnail(output_name)
+                if thumbnail:
+                    print(f"🖼️ Thumbnail created: {thumbnail}")
+                
+                # File size
+                file_size = os.path.getsize(output_name)
+                print(f"💾 File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            else:
+                print(f"❌ Failed to download video: HTTP {response.status_code}")
+        
+        analyze_video()
+        EOF
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: downloaded-files
+        path: |
+          *.mp4
+          *.mkv
+          *.webm
+          *.jpg
+          *.pdf
+        retention-days: 7
+
+    - name: Summary
+      run: |
+        echo "🎉 Download and processing completed!"
+        echo "📁 Files downloaded:"
+        ls -la *.mp4 *.mkv *.webm *.jpg *.pdf 2>/dev/null || echo "No files to display"
+        echo "📊 Disk usage:"
+        df -h
